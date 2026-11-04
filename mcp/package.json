@@ -1,13 +1,19 @@
 {
-  "name": "pingboard-mcp",
+  "name": "mingboard-mcp",
   "version": "0.1.0",
   "private": true,
-  "description": "Local MCP server for Pingboard PR triage, review requests, and CI workflows",
+  "description": "Local Mingboard dashboard and MCP server for shared PR triage and CI workflows",
   "type": "module",
-  "engines": { "node": ">=22" },
-  "bin": { "pingboard-mcp": "src/cli.mjs" },
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "mingboard-mcp": "src/cli.mjs",
+    "pingboard-mcp": "src/cli.mjs"
+  },
   "scripts": {
     "start": "node src/cli.mjs",
+    "web": "node src/web.mjs",
     "test": "node --test test/*.test.mjs"
   },
   "dependencies": {

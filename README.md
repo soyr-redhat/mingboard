@@ -1,10 +1,25 @@
-# Pingboard
+# Mingboard
 
 One board for the pull requests you are shepherding through CI. Pin the PRs you care about and each one tells you, in plain words, where it stands and what it needs next — instead of a browser tab per PR. The usual maintainer actions (update branch, run or retry CI, labels, approve, merge) are buttons on the board.
 
 <img width="1668" height="1027" alt="Screenshot 2026-10-08 at 12 57 06 PM" src="https://github.com/user-attachments/assets/458d4cbf-d81b-4962-937f-36c99a792ed9" />
 
-It is a static page that talks to the GitHub API from your browser: no server, no build step, no dependencies. It is tuned for [vllm-project/vllm](https://github.com/vllm-project/vllm) and works for any repository.
+Mingboard is a personal fork of [Pingboard](https://github.com/mgoin/pingboard). Its local dashboard and MCP server share one board, so changes made by an assistant appear in the browser automatically. It is tuned for [vllm-project/vllm](https://github.com/vllm-project/vllm) and works for any repository.
+
+## Run locally
+
+Requires Node.js 22 or newer. Use your existing authenticated GitHub CLI, or set `GITHUB_TOKEN` / `GH_TOKEN`, then run:
+
+```bash
+npm ci --prefix mcp
+npm run web --prefix mcp
+```
+
+Open [http://127.0.0.1:8787](http://127.0.0.1:8787). `MINGBOARD_PORT` selects a different port. The local server uses your GitHub credential in memory and proxies GitHub requests; the browser never receives the credential.
+
+The board stays in `~/.pingboard/board.json`, retaining the existing Pingboard path and saved pins. Both the dashboard and MCP must use the same file. Set `MINGBOARD_STATE_FILE` to override it; the older `PINGBOARD_STATE_FILE` is also accepted.
+
+The dashboard polls shared state while idle. Saves check the current board revision so an old browser snapshot cannot overwrite an intervening MCP change. If a save conflicts, Mingboard reloads the current board and asks you to retry the edit. Connection and save failures are shown rather than silently saving to a separate browser board.
 
 ## The board
 
@@ -28,13 +43,13 @@ Selecting a row opens the detail pane: the status with a one-line explanation, t
 
 **+ Add PRs** lists open pull requests in your default repository (yours, review requested, reviewed, involved, `ready`, all recent) and narrows as you type. Click to pin; pasting PR numbers or URLs works too. Type `@name` to see one author's PRs. To keep an eye on particular people, **Follow** them from a PR (or list them in Settings): their names are highlighted everywhere and Add PRs gets a **Following** list.
 
-**Sync search** in a group's header keeps that group in step with a GitHub search such as `review-requested:@me` or `author:@me label:ready`. Every five minutes Pingboard pins new open PRs it finds into the group. A PR the search pinned is unpinned again once it stops matching while still open; PRs you pinned yourself or moved to another group stay put, and one you unpin is not pinned again. Searches without a `repo:`, `org:` or `user:` qualifier are scoped to your default repository. Clear the search to stop syncing.
+**Sync search** in a group's header keeps that group in step with a GitHub search such as `review-requested:@me` or `author:@me label:ready`. Every five minutes Mingboard pins new open PRs it finds into the group. A PR the search pinned is unpinned again once it stops matching while still open; PRs you pinned yourself or moved to another group stay put, and one you unpin is not pinned again. Searches without a `repo:`, `org:` or `user:` qualifier are scoped to your default repository. Clear the search to stop syncing.
 
 Settings can also **unpin merged/closed PRs after a day** (off by default); **Clear merged / closed** does it at once.
 
 ## Related or unrelated failures
 
-Pingboard does not read logs — Buildkite logs are not reachable from a static page. It sorts failing jobs using what GitHub already knows:
+Mingboard does not read build logs. It sorts failing jobs using what GitHub already knows:
 
 - **N/M on base** — the same job failed on N of the last M base-branch commits that ran CI.
 - **also #123 #456** — the same job is failing on other PRs on your board.
@@ -51,9 +66,11 @@ Everything is done as you, with your token.
 
 Keyboard shortcuts exist for all of it; press `?` for the list.
 
-## Token
+## GitHub credentials
 
-Pingboard takes a **classic** personal access token with the `repo` scope (`public_repo` is enough for public repositories). It is sent only from your browser to `api.github.com`, and is kept in `sessionStorage` — or `localStorage` if you tick "Keep token after closing this tab". The board itself (pins, groups, preferences) lives in `localStorage` per GitHub login, so it belongs to one browser and one address. Settings has **Export board + settings** and **Import board + settings** buttons to back it up or move it. The backup never includes the GitHub token.
+Local mode looks for `GITHUB_TOKEN`, then `GH_TOKEN`, then the GitHub CLI's current credential. A classic token needs the `repo` scope (`public_repo` is enough for public repositories). The credential stays in the server process and is sent only to `api.github.com`; it is never saved in board data or returned to the dashboard.
+
+Settings has **Export board + settings** and **Import board + settings** for backups and transfers. Backups contain pins, groups and non-secret preferences. Local dashboard and MCP changes share the same file and do not need import/export to synchronize.
 
 ## Refresh and rate limits
 
@@ -61,31 +78,36 @@ Open PRs refresh every 60 seconds by default (configurable), background tabs fiv
 
 ## Other repositories
 
-`owner/repo#123` or a URL pins a PR from anywhere. The Settings button also lets you configure a repository's workflow directly in the browser: which checks count as CI, the gating pipeline, comment commands, quick labels, and merge method. Profiles are selectable from a dropdown and can be deleted; deleting a built-in profile override restores its built-in defaults. These overrides are cached in `localStorage` with the rest of that GitHub user's preferences, so they work on the published site and survive reloads. Built-in defaults live in `REPO_PROFILES` in `core.js`; repositories without a saved or built-in profile start with every check treated as CI and no CI commands.
+`owner/repo#123` or a URL pins a PR from anywhere. The Settings button also lets you configure a repository's workflow directly in the browser: which checks count as CI, the gating pipeline, comment commands, quick labels, and merge method. Profiles are selectable from a dropdown and can be deleted; deleting a built-in profile override restores its built-in defaults. In local mode these overrides are saved with the shared board preferences. In static mode they are stored in `localStorage` per GitHub login. Built-in defaults live in `REPO_PROFILES` in `core.js`; repositories without a saved or built-in profile start with every check treated as CI and no CI commands.
 
-## Run it
+## Static mode
 
-Open `index.html`, or serve the folder:
+The browser-only app can still run without Node:
 
 ```bash
 python3 -m http.server 8080
 ```
 
-The included workflow publishes the folder to GitHub Pages on every push to `main`.
+Open `index.html` or the served folder and connect with a GitHub token. In this mode the token is sent directly from the browser to GitHub and stays in `sessionStorage`, or `localStorage` when **Keep token after closing this tab** is enabled. Board data is also stored in the browser per GitHub login and origin.
+
+Static mode has a separate board from the local server. Use import/export to transfer snapshots. GitHub Pages serves this static mode; it cannot run the shared local backend or automatically read the local board file.
+
+The GitHub Pages workflow runs manually so pushing local Mingboard changes does not publish a separate static dashboard.
 
 ## MCP server
 
 The optional [local MCP server](mcp/README.md) lets an assistant read and manage a board, find PRs requesting your review, compare CI failures, and run, retry or cancel CI. It also supports updating a branch before running CI. The server and browser share the same profiles and status logic in `core.js`.
 
-The MCP board is stored in a local JSON file. Use the browser's **Export board + settings** with the MCP's `import_board` tool to transfer it; snapshots are not live-synced. The static website still works without Node or the MCP server.
+Run the MCP entrypoint from this checkout with the same state-file setting as the local dashboard. MCP pins and preferences then appear in the dashboard automatically. Static sites, including the upstream Pingboard website, remain separate; import/export transfers snapshots to and from those sites.
 
 ## Tests
 
 ```bash
+npm ci --prefix mcp
 ./tests/run
 ```
 
-Runs the browser compatibility checks. It needs [Bun](https://bun.sh) and installs everything else itself.
+Runs browser compatibility and shared-state integration checks. It needs Node.js 22+, [Bun](https://bun.sh), and the MCP dependencies installed above. The runner installs Playwright and its Chromium browser.
 
 For the MCP server, using Node.js 22 or newer:
 
@@ -94,4 +116,4 @@ npm ci --prefix mcp
 npm test --prefix mcp
 ```
 
-CI runs both suites. MCP tests mock GitHub and never perform live CI or PR mutations.
+CI runs both suites. Tests use temporary board files and mocked GitHub responses; they never modify your board or perform live GitHub mutations.

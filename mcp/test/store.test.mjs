@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { BoardStore } from "../src/store.mjs";
+import { BoardStore, SnapshotConflictError } from "../src/store.mjs";
 
 const repo = "mgoin/pingboard";
 async function setup(t) {
@@ -130,4 +130,107 @@ test("default repository switches preserve mixed pins and independent repository
   const expected = { ...before, prefs: { ...before.prefs, defaultRepo: "other/repo" } };
   await assert.rejects(store.setDefaultRepo("invalid"), /owner\/repo/);
   assert.deepEqual(await new BoardStore(filePath).read(), expected);
+});
+
+test("stale browser snapshots cannot erase a pin added by the MCP store", async (t) => {
+  const { filePath, store } = await setup(t);
+  await store.track({ repo, number: 1 });
+  const browser = await store.readSnapshot();
+  const mcp = new BoardStore(filePath);
+  await mcp.track({ repo, number: 2 });
+  const authoritative = await mcp.readSnapshot();
+  const unchanged = await readFile(filePath, "utf8");
+  assert.notEqual(authoritative.revision, browser.revision);
+  browser.board.groups[0].name = "Browser edit";
+  await assert.rejects(store.replaceSnapshot(browser, browser.revision), (error) => {
+    assert.ok(error instanceof SnapshotConflictError);
+    assert.equal(error.status, 409);
+    assert.deepEqual(error.snapshot, authoritative);
+    return true;
+  });
+  assert.equal(await readFile(filePath, "utf8"), unchanged);
+  assert.deepEqual((await store.read()).board.pins.map((pin) => pin.number), [1, 2]);
+});
+
+test("two concurrent browser writers using one revision produce one winner and one conflict", async (t) => {
+  const { filePath, store } = await setup(t);
+  const first = await store.readSnapshot();
+  const second = structuredClone(first);
+  first.board.groups[0].name = "First browser";
+  second.board.groups[0].name = "Second browser";
+  const attempts = await Promise.allSettled([
+    store.replaceSnapshot(first, first.revision),
+    new BoardStore(filePath).replaceSnapshot(second, second.revision)
+  ]);
+  const winners = attempts.filter((attempt) => attempt.status === "fulfilled");
+  const conflicts = attempts.filter((attempt) => attempt.status === "rejected");
+  assert.equal(winners.length, 1);
+  assert.equal(conflicts.length, 1);
+  assert.equal(conflicts[0].reason.status, 409);
+  assert.deepEqual(conflicts[0].reason.snapshot, winners[0].value);
+  assert.deepEqual(await store.readSnapshot(), winners[0].value);
+});
+
+test("snapshot saves preserve normalized browser metadata and the legacy disk format", async (t) => {
+  const { filePath, store } = await setup(t);
+  const fixture = JSON.parse(await readFile(new URL("../../tests/fixtures/v3-search-groups.json", import.meta.url), "utf8"));
+  await store.importBoard({
+    board: fixture.localStorage[`pingboard.v3.${fixture.login}.board`],
+    prefs: fixture.localStorage[`pingboard.v3.${fixture.login}.prefs`]
+  }, { mode: "replace" });
+  const before = await store.readSnapshot();
+  const edited = structuredClone(before);
+  edited.prefs.sort = "status";
+  edited.prefs.filter = "requested";
+  edited.prefs.owner = "others";
+  const saved = await store.replaceSnapshot(edited, before.revision);
+  assert.notEqual(saved.revision, before.revision);
+  assert.deepEqual(saved.board, before.board);
+  assert.deepEqual(saved.prefs, edited.prefs);
+  assert.equal(saved.prefs.unpinClosed, true);
+  assert.deepEqual(await new BoardStore(filePath).read(), { board: saved.board, prefs: saved.prefs });
+  const disk = JSON.parse(await readFile(filePath, "utf8"));
+  assert.deepEqual(disk, { pingboard: 1, board: saved.board, prefs: saved.prefs });
+  assert.deepEqual(await store.replaceSnapshot(saved, saved.revision), saved);
+
+  const reordered = { prefs: Object.fromEntries(Object.entries(saved.prefs).reverse()), board: saved.board };
+  assert.equal((await store.replaceSnapshot(reordered, saved.revision)).revision, saved.revision);
+  await store.setDefaultRepo("other/repo");
+  assert.notEqual((await store.readSnapshot()).revision, saved.revision);
+});
+
+test("incomplete or malformed snapshots fail without normalizing away stored data", async (t) => {
+  const { filePath, store } = await setup(t);
+  await store.track({ repo, number: 1 });
+  const saved = await store.readSnapshot();
+  const unchanged = await readFile(filePath, "utf8");
+  const malformed = [undefined, {}, { board: saved.board }, { prefs: saved.prefs }];
+  for (const change of [
+    (value) => { delete value.board.pins; },
+    (value) => { value.board.groups = []; },
+    (value) => { value.board.groups.push(null); },
+    (value) => { value.board.groups.push({ ...value.board.groups[0] }); },
+    (value) => { value.board.pins.push({ ...value.board.pins[0] }); },
+    (value) => { value.board.pins[0].number = 0; },
+    (value) => { value.board.pins[0].key = "wrong/key#1"; },
+    (value) => { value.board.pins[0].group = "missing"; },
+    (value) => { value.board.pins[0].via = "missing"; },
+    (value) => { value.board.pins[0].addedAt = Infinity; },
+    (value) => { value.board.groups[0].query = "repo:mgoin/pingboard"; value.board.groups[0].dismissed = Array(201).fill(`${repo}#2`); },
+    (value) => { delete value.prefs.defaultRepo; },
+    (value) => { value.prefs.boardWidth = Infinity; },
+    (value) => { value.prefs = null; }
+  ]) {
+    const value = structuredClone(saved);
+    change(value);
+    malformed.push(value);
+  }
+  for (const value of malformed) {
+    await assert.rejects(store.replaceSnapshot(value, saved.revision), (error) => error.status === 400);
+    assert.equal(await readFile(filePath, "utf8"), unchanged);
+  }
+  for (const revision of [undefined, null, "", "invalid"]) {
+    await assert.rejects(store.replaceSnapshot(saved, revision), (error) => error.status === 400);
+  }
+  assert.deepEqual(await store.readSnapshot(), saved);
 });

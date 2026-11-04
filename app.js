@@ -1,6 +1,6 @@
 "use strict";
 
-/* Pingboard — a board for the pull requests you are shepherding through CI.
+/* Mingboard — a board for the pull requests you are shepherding through CI.
    Static, no build step: talks to the GitHub API straight from the browser.
 
    Sections
@@ -19,7 +19,8 @@
 
 const TOKEN_KEY = "pingboard.githubToken";
 const SESSION_KEY = "pingboard.sessionToken";
-const API_ROOT = "https://api.github.com";
+const LOCAL_MODE = globalThis.MINGBOARD_LOCAL === true;
+const API_ROOT = LOCAL_MODE ? "/api/github" : "https://api.github.com";
 const API_VERSION = "2022-11-28";
 
 const Core = globalThis.PingboardCore;
@@ -128,8 +129,8 @@ function parseRefs(raw) {
 /* ── 2. state + persistence ────────────────────────────────────────────── */
 
 const state = {
-  token: localStorage.getItem(TOKEN_KEY) || sessionStorage.getItem(SESSION_KEY) || "",
-  remember: Boolean(localStorage.getItem(TOKEN_KEY)),
+  token: LOCAL_MODE ? "" : localStorage.getItem(TOKEN_KEY) || sessionStorage.getItem(SESSION_KEY) || "",
+  remember: !LOCAL_MODE && Boolean(localStorage.getItem(TOKEN_KEY)),
   user: null,
   authLoading: false,
   authError: "",
@@ -151,22 +152,90 @@ const state = {
   toasts: [],
   seq: 0,
   rate: { remaining: null, limit: null, reset: null },
-  lastSync: 0
+  lastSync: 0,
+  localSync: { connected: false, saving: false, error: "" }
 };
 
-function scopedKey(suffix) {
-  return `pingboard.v3.${state.user?.login || "anonymous"}.${suffix}`;
+let localBoard = null;
+
+function boardWritable() {
+  return !LOCAL_MODE || Boolean(localBoard?.isWritable());
 }
 
-function loadUserState() {
-  state.prefs = normalizePrefs(store.get(scopedKey("prefs"), {}));
+function boardSnapshot() {
+  return { board: cleanBoard(state.board), prefs: normalizePrefs(state.prefs) };
+}
 
-  state.board = cleanBoard(store.get(scopedKey("board"), null)) || { groups: [{ id: "g1", name: "Tracking", collapsed: false }], pins: [] };
+function applyLocalSnapshot(snapshot, reason) {
+  const board = cleanBoard(snapshot.board);
+  // Open dialogs and in-flight refreshes retain references to groups and pins.
+  const reconcile = (current, incoming, key) => {
+    const existing = new Map(current.map((item) => [item[key], item]));
+    return incoming.map((item) => {
+      const retained = existing.get(item[key]);
+      if (!retained) return item;
+      for (const name of Object.keys(retained)) if (!(name in item)) delete retained[name];
+      return Object.assign(retained, item);
+    });
+  };
+  state.board = {
+    groups: reconcile(state.board.groups, board.groups, "id"),
+    pins: reconcile(state.board.pins, board.pins, "key")
+  };
+  state.prefs = normalizePrefs(snapshot.prefs);
+  const keys = new Set(state.board.pins.map((pin) => pin.key));
+  for (const key of state.data.keys()) if (!keys.has(key)) state.data.delete(key);
+  for (const key of state.status.keys()) if (!keys.has(key)) state.status.delete(key);
+  for (const id of state.searches.keys()) {
+    if (!state.board.groups.some((group) => group.id === id)) state.searches.delete(id);
+  }
+  if (!keys.has(state.cursor)) state.cursor = null;
+  applyBoardWidth();
+  if (state.user && reason === "external") tick();
+  render();
+}
+
+async function connectLocalBoard() {
+  localBoard?.stop();
+  const client = globalThis.MingboardBoardClient.createBoardClient({
+    isActive: () => !document.hidden && !pointerHeld && !dragKey,
+    onSnapshot: (snapshot, reason) => {
+      if (localBoard === client && !(reason === "saved" && pointerHeld)) applyLocalSnapshot(snapshot, reason);
+    },
+    onError: (message) => {
+      if (localBoard !== client) return;
+      state.localSync.error = message;
+      if (state.user) toast(message, "error");
+      render();
+    },
+    onStatus: ({ connected, saving }) => {
+      if (localBoard !== client) return;
+      const reconnected = connected && !state.localSync.connected;
+      state.localSync = { connected, saving, error: connected ? "" : state.localSync.error };
+      if (reconnected && state.user) tick();
+      render();
+    }
+  });
+  localBoard = client;
+  const session = await client.load();
+  client.start();
+  return session.user;
+}
+
+function scopedKey(suffix, login = state.user?.login || "anonymous") {
+  return `pingboard.v3.${login}.${suffix}`;
+}
+
+function loadUserStateFor(user) {
+  state.prefs = normalizePrefs(store.get(scopedKey("prefs", user.login), {}));
+
+  state.board = cleanBoard(store.get(scopedKey("board", user.login), null)) || { groups: [{ id: "g1", name: "Tracking", collapsed: false }], pins: [] };
   state.cursor = null;
 }
 
 /* Another tab saved the board: adopt it, so this tab never writes a stale copy back over it. */
 function syncFromStorage(event) {
+  if (LOCAL_MODE) return;
   if (!state.user || event.storageArea !== localStorage) return;
   if (event.key === scopedKey("board")) {
     let board = null;
@@ -213,7 +282,7 @@ async function importBoard(file) {
   } catch {
     /* handled below */
   }
-  if (!board) return toast("That file is not a Pingboard backup", "error");
+  if (!board) return toast("That file is not a Mingboard backup", "error");
   const count = `${board.pins.length} pull request${board.pins.length === 1 ? "" : "s"}`;
   const applyPrefs = () => {
     if (!prefs) return;
@@ -275,10 +344,12 @@ function authorName(login) {
 }
 
 function persistBoard() {
+  if (LOCAL_MODE) return localBoard?.save(boardSnapshot());
   store.set(scopedKey("board"), state.board);
 }
 
 function persistPrefs() {
+  if (LOCAL_MODE) return localBoard?.save(boardSnapshot());
   store.set(scopedKey("prefs"), state.prefs);
 }
 
@@ -286,13 +357,14 @@ function persistPrefs() {
 
 function authHeaders() {
   return {
-    Authorization: `Bearer ${state.token}`,
+    ...(LOCAL_MODE ? localBoard?.headers() : { Authorization: `Bearer ${state.token}` }),
     Accept: "application/vnd.github+json",
     "X-GitHub-Api-Version": API_VERSION
   };
 }
 
 async function rest(method, path, body) {
+  if (LOCAL_MODE && !boardWritable()) throw new Error("The shared board is disconnected. Reconnect before continuing.");
   const response = await fetch(`${API_ROOT}${path}`, {
     method,
     headers: { ...authHeaders(), ...(body ? { "Content-Type": "application/json" } : {}) },
@@ -311,6 +383,7 @@ async function rest(method, path, body) {
 }
 
 async function gql(query, variables = {}, { strict = false, partial = false } = {}) {
+  if (LOCAL_MODE && !boardWritable()) throw new Error("The shared board is disconnected. Reconnect before continuing.");
   const response = await fetch(`${API_ROOT}/graphql`, {
     method: "POST",
     headers: { ...authHeaders(), "Content-Type": "application/json" },
@@ -652,6 +725,8 @@ async function refreshPins(batch) {
 }
 
 function settleRefresh(pin, pr) {
+  pin = pinByKey(pin.key);
+  if (!pin) return;
   if (pr instanceof Error) {
     state.status.set(pin.key, { at: Date.now(), loading: false, error: pr.message });
     return;
@@ -664,7 +739,7 @@ function settleRefresh(pin, pr) {
   state.status.set(pin.key, { at: Date.now(), loading: false, error: "", unknownTries });
   if (unknownTries && unknownTries <= 2) setTimeout(() => pinByKey(pin.key) && queueRefresh(pin), 4000);
   state.lastSync = Date.now();
-  if (!pin.seen) {
+  if (!pin.seen && boardWritable()) {
     pin.seen = signature(pr);
     persistBoard();
   }
@@ -701,7 +776,7 @@ function refreshBaselines() {
 }
 
 function tick() {
-  if (!state.user) return;
+  if (!state.user || !boardWritable()) return;
   const now = Date.now();
   const throttled = state.rate.remaining !== null && state.rate.remaining < RATE_FLOOR && now < state.rate.reset;
   if (!throttled) {
@@ -734,6 +809,7 @@ function tick() {
    search pinned is unpinned once two searches in a row miss it while it is still open;
    the forced refresh in between shows a merge as merged instead of making it vanish. */
 async function syncGroup(id) {
+  if (!boardWritable()) return;
   const group = state.board.groups.find((item) => item.id === id);
   const status = state.searches.get(id) || { missing: new Set() };
   if (!group?.query || status.loading) return;
@@ -741,6 +817,7 @@ async function syncGroup(id) {
   state.searches.set(id, { ...status, loading: true });
   try {
     const data = await gql(SEARCH_QUERY, { query: `is:pr is:open ${query} sort:updated-desc` });
+    if (!boardWritable()) return;
     const current = state.board.groups.find((item) => item.id === id);   // another tab may have replaced the board
     if (current?.query !== query) {
       state.searches.delete(id);
@@ -920,6 +997,7 @@ function renameGroup(group) {
     value: group.name,
     submit: "Rename",
     onSubmit(name) {
+      if (!state.board.groups.includes(group)) return "This group was removed elsewhere. Close this dialog and try again.";
       if (state.board.groups.some((other) => other !== group && other.name.toLowerCase() === name.toLowerCase())) return `There is already a group called "${name}".`;
       group.name = name;
       persistBoard();
@@ -937,6 +1015,7 @@ function editGroupSearch(group) {
     submit: "Save",
     allowEmpty: true,
     onSubmit(text) {
+      if (!state.board.groups.includes(group)) return "This group was removed elsewhere. Close this dialog and try again.";
       // Scoped to the default repository like Add PRs, unless it names its own scope.
       const query = !text || /(^|\s)(repo|org|user):/.test(text) ? text : `repo:${state.prefs.defaultRepo} ${text}`;
       if (query) Object.assign(group, { query, dismissed: group.dismissed || [] });
@@ -957,7 +1036,10 @@ function deleteGroup(group) {
   const fallback = state.board.groups.find((item) => item !== group);
   const count = state.board.pins.filter((pin) => pin.group === group.id).length;
   const remove = () => {
-    for (const pin of state.board.pins) if (pin.group === group.id) pin.group = fallback.id;
+    if (!state.board.groups.includes(group)) return toast("This group was already removed elsewhere.");
+    const currentFallback = state.board.groups.find((item) => item !== group);
+    if (!currentFallback) return toast("The board needs at least one group");
+    for (const pin of state.board.pins) if (pin.group === group.id) pin.group = currentFallback.id;
     state.board.groups = state.board.groups.filter((item) => item !== group);
     persistBoard();
     render();
@@ -1374,15 +1456,16 @@ function updateTitle() {
     if (pr.ci.state === "running") running += 1;
   }
   const badge = [failing && `${failing}✗`, running && `${running}●`].filter(Boolean).join(" ");
-  document.title = `${badge ? `${badge} · ` : ""}Pingboard`;
+  document.title = `${badge ? `${badge} · ` : ""}Mingboard`;
 }
 
 function buildShell() {
   return el("div", { class: "shell" }, [
     el("header", { class: "top" }, [
-      el("div", { class: "brand" }, [el("span", { class: "brand-dot" }), "Pingboard"]),
+      el("div", { class: "brand" }, [el("span", { class: "brand-dot" }), "Mingboard"]),
       el("div", { class: "top-right" }, [
         el("span", { class: "sync", id: "sync" }),
+        LOCAL_MODE && el("button", { class: "btn", id: "board-reconnect", text: "Reconnect", onclick: () => localBoard?.poll() }),
         el("button", { class: "btn primary", onclick: () => openAdd(), text: "+ Add PRs" }),
         el("button", { class: "btn", title: "Refresh everything now", onclick: refreshAll, text: "Refresh" }),
         el("button", { class: "btn", id: "me", title: "Settings", onclick: openSettings })
@@ -1496,11 +1579,16 @@ function renderTop() {
   const busy = refreshActive > 0;
   const rate = state.rate.remaining;
   const throttled = rate !== null && rate < RATE_FLOOR;
-  const parts = [busy ? "syncing…" : state.lastSync ? `synced ${ago(state.lastSync)} ago` : ""];
+  const parts = [
+    LOCAL_MODE ? !state.localSync.connected ? "Board disconnected" : state.localSync.saving ? "Saving board…" : "Board shared with MCP" : "",
+    busy ? "syncing…" : state.lastSync ? `synced ${ago(state.lastSync)} ago` : ""
+  ];
   if (rate !== null) parts.push(throttled ? `rate limit low (${rate}) — paused until ${new Date(state.rate.reset).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : `${rate} api`);
   const sync = document.querySelector("#sync");
-  sync.className = `sync${busy ? " busy" : ""}${throttled ? " warn" : ""}`;
+  sync.className = `sync${busy ? " busy" : ""}${throttled || (LOCAL_MODE && !state.localSync.connected) ? " warn" : ""}`;
   sync.textContent = parts.filter(Boolean).join(" · ");
+  sync.title = state.localSync.error || "";
+  if (LOCAL_MODE) document.querySelector("#board-reconnect").hidden = state.localSync.connected;
   document.querySelector("#me").textContent = "Settings";
   document.querySelector("#sort").value = state.prefs.sort;
 }
@@ -1526,7 +1614,7 @@ function renderBoard(index) {
   if (!state.board.pins.length && state.board.groups.length === 1) {
     board.replaceChildren(el("div", { class: "empty" }, [
       el("h2", { text: "Nothing pinned yet" }),
-      el("p", { text: "Pin the pull requests you are shepherding. Pingboard keeps their CI, branch freshness and review state in one view, and tells you what each one needs next." }),
+      el("p", { text: "Pin the pull requests you are shepherding. Mingboard keeps their CI, branch freshness and review state in one view, and tells you what each one needs next." }),
       el("button", { class: "btn primary big", onclick: () => openAdd(), text: "+ Add pull requests" })
     ]));
     return;
@@ -1917,6 +2005,13 @@ function renderOverlays() {
 /* Auth view */
 
 function buildAuth() {
+  if (LOCAL_MODE) return el("section", { class: "auth" }, [
+    el("div", { class: "brand large" }, [el("span", { class: "brand-dot" }), "Mingboard"]),
+    el("p", { class: "auth-sub", text: "Your pull request board, shared with your MCP assistant." }),
+    el("p", { class: state.authError ? "t-fail" : "muted", text: state.authError || "Connecting to your local board…" }),
+    el("button", { class: "btn primary", disabled: state.authLoading, onclick: connect,
+      text: state.authLoading ? "Connecting…" : "Connect to local board" })
+  ]);
   const input = el("input", {
     id: "token",
     type: "password",
@@ -1932,7 +2027,7 @@ function buildAuth() {
     }
   });
   return el("section", { class: "auth" }, [
-    el("div", { class: "brand large" }, [el("span", { class: "brand-dot" }), "Pingboard"]),
+    el("div", { class: "brand large" }, [el("span", { class: "brand-dot" }), "Mingboard"]),
     el("p", { class: "auth-sub", text: "One compact board for the pull requests you are shepherding through CI — status, failures, branch freshness and the usual maintainer actions, without a tab per PR." }),
     el("label", { for: "token", text: "GitHub classic token" }),
     input,
@@ -1956,21 +2051,21 @@ function buildAuth() {
 }
 
 async function connect() {
-  if (!state.token || state.authLoading) return;
+  if ((!LOCAL_MODE && !state.token) || state.authLoading) return;
   state.authLoading = true;
   state.authError = "";
   rerenderAuth();
   try {
-    const user = await rest("GET", "/user");
-    if (state.remember) {
+    const user = LOCAL_MODE ? await connectLocalBoard() : await rest("GET", "/user");
+    if (!LOCAL_MODE && state.remember) {
       localStorage.setItem(TOKEN_KEY, state.token);
       sessionStorage.removeItem(SESSION_KEY);
-    } else {
+    } else if (!LOCAL_MODE) {
       sessionStorage.setItem(SESSION_KEY, state.token);
       localStorage.removeItem(TOKEN_KEY);
     }
+    if (!LOCAL_MODE) loadUserStateFor(user);
     state.user = user;
-    loadUserState();
     tick();
   } catch (error) {
     state.authError = state.authError || error.message;
@@ -1985,8 +2080,13 @@ function rerenderAuth() {
 }
 
 function signOut(message = "") {
-  localStorage.removeItem(TOKEN_KEY);
-  sessionStorage.removeItem(SESSION_KEY);
+  localBoard?.stop();
+  localBoard = null;
+  state.localSync = { connected: false, saving: false, error: "" };
+  if (!LOCAL_MODE) {
+    localStorage.removeItem(TOKEN_KEY);
+    sessionStorage.removeItem(SESSION_KEY);
+  }
   state.token = "";
   state.user = null;
   state.modal = null;
@@ -2404,25 +2504,26 @@ function openSettings() {
     if (!/^[\w.-]+\/[\w.-]+$/.test(profileRepo)) return toast("Workflow repository must look like owner/name", "error");
     const commands = Object.fromEntries(PROFILE_COMMAND_KEYS.map((key) => [key, commandInputs[key].value.trim()]));
     const hasCommands = PROFILE_COMMAND_KEYS.some((key) => commands[key]);
-    state.prefs.defaultRepo = repo;
-    state.prefs.interval = Number(interval.value);
-    state.prefs.notify = notify.checked;
-    state.prefs.unpinClosed = unpinClosed.checked;
-    state.prefs.following = parseLogins(following.value);
-    state.prefs.repoProfiles = {
-      ...state.prefs.repoProfiles,
-      [profileRepo]: normalizeProfile({
+    const draft = {
+      defaultRepo: repo,
+      interval: Number(interval.value),
+      notify: notify.checked,
+      unpinClosed: unpinClosed.checked,
+      following: parseLogins(following.value)
+    };
+    const profile = normalizeProfile({
         ciPrefix: ciPrefix.value,
         mainPipeline: mainPipeline.value,
         ciCommands: hasCommands ? commands : null,
         quickLabels: quickLabels.value.split(",").map((label) => label.trim()).filter(Boolean),
         mergeMethod: mergeMethod.value
-      }, REPO_PROFILES[profileRepo] || GENERIC_PROFILE)
-    };
+      }, REPO_PROFILES[profileRepo] || GENERIC_PROFILE);
     if (notify.checked && "Notification" in window && Notification.permission !== "granted") {
-      state.prefs.notify = (await Notification.requestPermission()) === "granted";
-      if (!state.prefs.notify) toast("Browser notifications are blocked for this site", "error");
+      draft.notify = (await Notification.requestPermission()) === "granted";
+      if (!draft.notify) toast("Browser notifications are blocked for this site", "error");
     }
+    if (!state.user || !boardWritable()) return toast("Reconnect to the shared board before saving settings.", "error");
+    state.prefs = { ...state.prefs, ...draft, repoProfiles: { ...state.prefs.repoProfiles, [profileRepo]: profile } };
     persistPrefs();
     closeModal();
   };
@@ -2433,7 +2534,7 @@ function openSettings() {
       el("label", { class: "field" }, ["Default repository", repoInput]),
       el("p", { class: "muted small", text: "Used for bare PR numbers and for the Add PRs lists." }),
       el("h2", { text: "Repository workflow" }),
-      el("p", { class: "muted small", text: "These settings are saved in this browser. Choose the repository whose CI, commands, labels and merge behavior you want to configure." }),
+      el("p", { class: "muted small", text: `${LOCAL_MODE ? "These settings are shared with your MCP board." : "These settings are saved in this browser."} Choose the repository whose CI, commands, labels and merge behavior you want to configure.` }),
       el("div", { class: "field" }, [
         "Workflow profile",
         el("div", { class: "settings-profile-controls" }, [profileSelect, deleteProfileButton])
@@ -2452,7 +2553,9 @@ function openSettings() {
       el("label", { class: "check-row" }, [unpinClosed, "Unpin merged/closed PRs after a day"]),
       el("label", { class: "field" }, ["Following", following]),
       el("p", { class: "muted small", text: "Their names are highlighted, and Add PRs gets a Following list." }),
-      el("p", { class: "muted small", text: `Your board is saved in this browser for ${location.host}. Export it to move it to another browser or address, or to keep a copy.` })
+      el("p", { class: "muted small", text: LOCAL_MODE
+        ? "Your board is saved by the local Mingboard server and shared with MCP. Export it to keep a backup."
+        : `Your board is saved in this browser for ${location.host}. Export it to move it to another browser or address, or to keep a copy.` })
     ]),
     el("div", { class: "settings-footer" }, [
       el("div", { class: "settings-backup" }, [
@@ -2471,11 +2574,11 @@ function openSettings() {
         ]),
         el("button", {
           class: "btn danger",
-          text: "Sign out",
+          text: LOCAL_MODE ? "Disconnect" : "Sign out",
           onclick: () => openChoice({
-            title: "Sign out?",
-            body: "This removes the token from this browser. Your board stays saved for next time.",
-            options: [{ key: "Enter", label: "Sign out", danger: true, run: () => signOut() }]
+            title: LOCAL_MODE ? "Disconnect?" : "Sign out?",
+            body: LOCAL_MODE ? "This disconnects this tab. Your shared board and GitHub login remain available on the local server." : "This removes the token from this browser. Your board stays saved for next time.",
+            options: [{ key: "Enter", label: LOCAL_MODE ? "Disconnect" : "Sign out", danger: true, run: () => signOut() }]
           })
         })
       ])
@@ -2511,7 +2614,7 @@ const HELP = [
 function openHelp() {
   mountModal({}, el("div", { class: "modal" }, [
     el("h2", { text: "How failures are sorted" }),
-    el("p", { class: "muted", text: "Pingboard does not read logs. A failing job counts as “likely unrelated” when the same job failed on recent base-branch commits or is failing on other PRs you have pinned; everything else is “to look at”." }),
+    el("p", { class: "muted", text: "Mingboard does not read logs. A failing job counts as “likely unrelated” when the same job failed on recent base-branch commits or is failing on other PRs you have pinned; everything else is “to look at”." }),
     el("h2", { text: "Keyboard shortcuts" }),
     el("div", { class: "help" }, HELP.flatMap(([keys, what]) => [el("span", { class: "help-keys", text: keys }), el("span", { text: what })])),
     el("div", { class: "modal-foot" }, [el("span"), el("button", { class: "btn", onclick: closeModal, text: "Close" })])
@@ -2604,10 +2707,11 @@ window.addEventListener("resize", () => applyBoardWidth());
 window.addEventListener("storage", syncFromStorage);
 
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) tick();
+  if (!document.hidden) { localBoard?.poll(); tick(); }
 });
+window.addEventListener("focus", () => localBoard?.poll());
 
 setInterval(tick, TICK_MS);
 
-if (state.token) connect();
+if (LOCAL_MODE || state.token) connect();
 else render();

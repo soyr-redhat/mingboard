@@ -1,7 +1,8 @@
 import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { dirname, basename, resolve } from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
+import { isDeepStrictEqual } from "node:util";
 import core from "../../core.js";
 
 const { cleanBoard, normalizePrefs, pinKey, profileFor } = core;
@@ -48,6 +49,63 @@ function parseBackup(payload) {
     throw new Error("The backup contains invalid group IDs or pull request numbers.");
   }
   return { board, prefs: hasOwn(value, "prefs") ? normalizePrefs(value.prefs) : null };
+}
+
+function invalidSnapshot(message) {
+  const error = new Error(`Invalid board snapshot: ${message}`);
+  error.status = 400;
+  return error;
+}
+
+function parseSnapshot(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+    || !value.board || typeof value.board !== "object" || Array.isArray(value.board)
+    || !value.prefs || typeof value.prefs !== "object" || Array.isArray(value.prefs)) {
+    throw invalidSnapshot("Complete board and preferences objects are required.");
+  }
+  let board;
+  let prefs;
+  try {
+    board = cleanBoard(value.board);
+    prefs = normalizePrefs(value.prefs);
+  } catch {
+    throw invalidSnapshot("Groups, pins, and preferences must be valid normalized data.");
+  }
+  if (!board || !isDeepStrictEqual(value.board, board) || !isDeepStrictEqual(value.prefs, prefs)) {
+    throw invalidSnapshot("Groups, pins, and preferences must be complete and normalized; no entries may be dropped.");
+  }
+  const groupIds = new Set(board.groups.map((group) => group.id));
+  if (groupIds.size !== board.groups.length || board.groups.some((group) => !group.id.trim())
+    || !Number.isFinite(prefs.boardWidth) || prefs.boardWidth <= 0
+    || board.pins.some((pin) => !Number.isSafeInteger(pin.number)
+      || !Number.isFinite(pin.addedAt) || pin.addedAt <= 0
+      || !groupIds.has(pin.group) || (hasOwn(pin, "via") && !groupIds.has(pin.via)))) {
+    throw invalidSnapshot("Group IDs and pin references, numbers, and timestamps must be valid and unique.");
+  }
+  return { board, prefs };
+}
+
+function canonical(value) {
+  if (Array.isArray(value)) return value.map(canonical);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonical(value[key])]));
+  }
+  return value;
+}
+
+function snapshotFor({ board, prefs }) {
+  const state = { board: cleanBoard(board), prefs: normalizePrefs(prefs) };
+  const revision = createHash("sha256").update(JSON.stringify(canonical(state))).digest("hex");
+  return { ...state, revision };
+}
+
+export class SnapshotConflictError extends Error {
+  constructor(snapshot) {
+    super("The board changed elsewhere. Reload it before saving your edit again.");
+    this.name = "SnapshotConflictError";
+    this.status = 409;
+    this.snapshot = snapshot;
+  }
 }
 
 function enqueue(filePath, operation) {
@@ -179,6 +237,24 @@ export class BoardStore {
 
   read() {
     return enqueue(this.filePath, () => this._read());
+  }
+
+  readSnapshot() {
+    return enqueue(this.filePath, async () => snapshotFor(await this._read()));
+  }
+
+  async replaceSnapshot(value, expectedRevision) {
+    const replacement = parseSnapshot(value);
+    if (typeof expectedRevision !== "string" || !/^[a-f0-9]{64}$/.test(expectedRevision)) {
+      throw invalidSnapshot("The revision from the last board read is required.");
+    }
+    return this._mutate((state) => {
+      const current = snapshotFor(state);
+      if (current.revision !== expectedRevision) throw new SnapshotConflictError(current);
+      state.board = replacement.board;
+      state.prefs = replacement.prefs;
+      return snapshotFor(state);
+    });
   }
 
   async track({ repo, number, group } = {}) {

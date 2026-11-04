@@ -45,6 +45,14 @@ jobs:
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
 
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install local server dependencies
+        run: npm ci --prefix head/mcp
+
       - name: Run tests
         run: head/tests/run
         env:

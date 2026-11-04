@@ -1,10 +1,10 @@
-# Pingboard MCP
+# Mingboard MCP
 
-A local stdio MCP server sharing the dashboard's repository profiles, CI status logic and failure comparisons.
+A local stdio MCP server sharing the dashboard's board, repository profiles, CI status logic and failure comparisons. Mingboard builds on [Pingboard](https://github.com/mgoin/pingboard).
 
 ## Setup
 
-Requires Node.js 22 or newer. Keep `mcp/` inside the Pingboard checkout because it imports `../core.js`.
+Requires Node.js 22 or newer. Keep `mcp/` inside the Mingboard checkout because it imports `../core.js`.
 
 ```bash
 npm ci --prefix mcp
@@ -15,21 +15,35 @@ Configure your MCP client to launch the entrypoint directly:
 ```json
 {
   "mcpServers": {
-    "pingboard": {
+    "mingboard": {
       "command": "node",
-      "args": ["/absolute/path/to/pingboard/mcp/src/cli.mjs"],
+      "args": ["/absolute/path/to/mingboard/mcp/src/cli.mjs"],
       "env": {
         "GITHUB_TOKEN": "YOUR_GITHUB_TOKEN",
-        "PINGBOARD_STATE_FILE": "/absolute/path/to/private/pingboard-board.json"
+        "MINGBOARD_STATE_FILE": "/absolute/path/to/private/pingboard-board.json"
       }
     }
   }
 }
 ```
 
-On Windows, use forward slashes in paths or escape backslashes. Use your client's secret/environment facility for the token when available. `GH_TOKEN` is also accepted; `GITHUB_TOKEN` takes precedence. Tokens are never stored in the board or exported. GitHub permissions apply as usual; a classic PAT needs `public_repo` for public repositories or `repo` for private ones.
+On Windows, use forward slashes in paths or escape backslashes. Use your client's secret/environment facility for the token when available. Credentials are read from `GITHUB_TOKEN`, then `GH_TOKEN`, then the current GitHub CLI login (`gh auth token`). The environment token entry can be omitted when using the GitHub CLI credential. Tokens stay in server memory and are never stored in the board or exported. GitHub permissions apply as usual; a classic PAT needs `public_repo` for public repositories or `repo` for private ones.
 
-The state file defaults to `~/.pingboard/board.json`. Keep it outside a publicly served directory and use separate files for separate accounts. Local board tools work without a token; GitHub operations require one. This server targets github.com.
+The state file defaults to `~/.pingboard/board.json`, preserving existing boards. `MINGBOARD_STATE_FILE` takes precedence over the legacy `PINGBOARD_STATE_FILE`. Keep the file outside a publicly served directory and use separate files for separate accounts. Local board tools work without a token; GitHub operations require one. This server targets github.com.
+
+## Shared dashboard
+
+From the checkout root:
+
+```bash
+npm run web --prefix mcp
+```
+
+Open [http://127.0.0.1:8787](http://127.0.0.1:8787), or set `MINGBOARD_PORT` for another port. Configure the dashboard process and MCP client with the same state-file path. Both read and write the same board; MCP changes appear in the active dashboard without importing a snapshot. The dashboard uses a local GitHub proxy and never receives the GitHub credential.
+
+Only loopback access is supported. The server validates its host and request origin, protects API requests with a server-generated capability, and serves an explicit list of application assets. Browser saves use a revision guard; a concurrent change triggers a reload and visible retry message rather than overwriting it.
+
+`npm start --prefix mcp` still starts the stdio MCP server. The `mingboard-mcp` executable and legacy `pingboard-mcp` alias both launch the same entrypoint.
 
 ## Tools
 
@@ -52,7 +66,7 @@ To switch away from vLLM, call `set_default_repo` with `{"repo":"mgoin/pingboard
 
 ## Board exchange
 
-The browser and MCP use separate boards. Export from **Settings → Export board + settings**, then pass the parsed JSON as `import_board.payload`. Merge keeps existing pins and matches group names; replace overwrites the board. Either mode applies preferences included in the backup. Save the JSON returned by `export_board` to import it back into the browser.
+The local dashboard and MCP share a board when configured with the same state file. Browser-only static sites use separate browser storage. To transfer a static board, export from **Settings → Export board + settings**, then pass the parsed JSON as `import_board.payload`. Merge keeps existing pins and matches group names; replace overwrites the board. Either mode applies preferences included in the backup. Save the JSON returned by `export_board` to import it into a static browser board.
 
 Clearing preserves groups and preferences, retains unreadable PRs when filtering by state, and never closes GitHub PRs. Writes use atomic replacement and a process lock. Corrupt state is reported without overwriting it. If a stopped process leaves a `.lock` file, confirm no server is writing that board before removing the lock.
 
@@ -72,4 +86,4 @@ Failure matching is evidence, not a log diagnosis. Missing baseline or peer data
 npm test --prefix mcp
 ```
 
-Focused tests cover board persistence, CI sequencing and failure handling, shared status logic, and an actual stdio MCP connection. GitHub calls are mocked. The existing `tests/run` checks browser behavior and saved-state upgrades.
+Focused tests cover board persistence, revision conflicts, the local HTTP boundary, CI sequencing and failure handling, shared status logic, and an actual stdio MCP connection. GitHub calls are mocked. `tests/run` checks browser behavior, saved-state upgrades, and browser/MCP synchronization against temporary board data.
