@@ -82,6 +82,8 @@ Open PRs refresh every 60 seconds by default (configurable), background tabs fiv
 
 ## Static mode
 
+Hosted dashboard: [soyr-redhat.github.io/mingboard](https://soyr-redhat.github.io/mingboard/).
+
 The browser-only app can still run without Node:
 
 ```bash
@@ -92,7 +94,7 @@ Open `index.html` or the served folder and connect with a GitHub token. In this 
 
 Static mode has a separate board from the local server. Use import/export to transfer snapshots. GitHub Pages serves this static mode; it cannot run the shared local backend or automatically read the local board file.
 
-The GitHub Pages workflow runs manually so pushing local Mingboard changes does not publish a separate static dashboard.
+The GitHub Pages workflow deploys the browser-only dashboard on every push to `main` and can also be run manually. It publishes only the six client assets. Pins, preferences, and tokens stay in your browser and are never included in the deployment.
 
 ## MCP server
 
